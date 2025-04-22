@@ -2,13 +2,17 @@
 #include <DHT11.h>
 #include <IRremote.hpp>
 #include <LiquidCrystal_I2C.h>
+#include <MFRC522.h>
+#include <SPI.h>
 
 #define IR_RECEIVE_PIN 2
 #define IR_SEND_PIN 4
+#define SS_PIN 10
+#define RST_PIN 9
 
-DHT11 dht11(8);
-
+DHT11 dht11(7);
 LiquidCrystal_I2C lcd(0x27, 16, 2);
+MFRC522 mfrc522(SS_PIN, RST_PIN);
 
 struct IRSignal {
   String name;
@@ -25,10 +29,18 @@ IRSignal storedSignals[3] = {
 
 int targetTemp = 24;
 bool acOn = false;
+bool isAuthenticated = false;
+bool autoControl = false;
+
 unsigned long lastUpdate = 0;
+unsigned long authStartTime = 0;
+unsigned long lastIRInteraction = 0;
+
+const unsigned long AUTH_DURATION = 30000;
+const unsigned long IR_CONTROL_TIMEOUT = 15000;
 
 void setup() {
-  Serial.begin(115200);
+  Serial.begin(9600);
   IrReceiver.begin(IR_RECEIVE_PIN, ENABLE_LED_FEEDBACK);
   IrSender.begin(IR_SEND_PIN);
 
@@ -38,15 +50,62 @@ void setup() {
   lcd.print("AC Controller");
   delay(1000);
   lcd.clear();
+
+  SPI.begin();
+  mfrc522.PCD_Init();
+  Serial.println("Place RFID card near reader...");
 }
 
 void loop() {
-  if (millis() - lastUpdate > 1000) {
+  if (millis() - lastUpdate > 2000) {
     int temperature = dht11.readTemperature();
+    // Serial.println(temperature);
+    delay(2000);
+
+    // Auto control only if no IR input recently
+    if (millis() - lastIRInteraction > IR_CONTROL_TIMEOUT) {
+      if (temperature < 24) {
+        acOn = true;
+        targetTemp = 26;
+        autoControl = true;
+      } else if (temperature > 27) {
+        acOn = false;
+        targetTemp = 26;
+        autoControl = true;
+      } else {
+        autoControl = false;
+      }
+    }
+
     updateLCD(temperature);
     lastUpdate = millis();
   }
 
+  // Authentication timeout
+  if (isAuthenticated && millis() - authStartTime > AUTH_DURATION) {
+    isAuthenticated = false;
+    Serial.println("Access expired. Scan RFID again.");
+  }
+
+  // RFID authentication
+  if (!isAuthenticated) {
+    if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) {
+      Serial.print("UID: ");
+      for (byte i = 0; i < mfrc522.uid.size; i++) {
+        Serial.print(mfrc522.uid.uidByte[i] < 0x10 ? "0" : "");
+        Serial.print(mfrc522.uid.uidByte[i], HEX);
+      }
+      Serial.println();
+
+      isAuthenticated = true;
+      authStartTime = millis();
+      Serial.println("RFID authenticated. IR remote now active for 30 seconds.");
+      mfrc522.PICC_HaltA();
+    }
+    return;
+  }
+
+  // Handle IR input
   if (IrReceiver.decode()) {
     handleIR();
     IrReceiver.resume();
@@ -72,6 +131,10 @@ void handleIR() {
       Serial.print("Matched: ");
       Serial.println(storedSignals[i].name);
 
+      // Register manual IR usage
+      lastIRInteraction = millis();
+      autoControl = false;
+
       if (storedSignals[i].name == "power") {
         acOn = !acOn;
       } else if (storedSignals[i].name == "up") {
@@ -80,7 +143,7 @@ void handleIR() {
         targetTemp--;
       }
 
-      IrSender.sendNEC(addr, cmd, 0);
+      IrSender.sendLG(addr, cmd, 0);
       return;
     }
   }
